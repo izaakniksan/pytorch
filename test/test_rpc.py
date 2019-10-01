@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import functools
 import sys
 import unittest
 from os import getenv
@@ -10,6 +11,7 @@ import torch.distributed as dist
 from common_distributed import MultiProcessTestCase
 from common_utils import load_tests, run_tests
 from torch.distributed.rpc import RpcBackend
+import torch.distributed.rpc_backend_registry as rpc_backend_registry
 
 
 if not dist.is_available():
@@ -19,6 +21,11 @@ if not dist.is_available():
 
 BACKEND = getenv("RPC_BACKEND", RpcBackend.PROCESS_GROUP)
 RPC_INIT_URL = getenv("RPC_INIT_URL", "")
+
+
+def stub_init_rpc_backend_handler(self_rank, self_name, init_method):
+    return mock.Mock()  # RpcAgent.
+
 
 # it is used to test python user defined function over rpc
 def my_function(a, b, c):
@@ -72,26 +79,23 @@ class my_class:
 load_tests = load_tests
 
 
-def _wrap_with_rpc(func):
-    """
+def _wrap_with_rpc(test_method):
+    '''
         We use this decorator for setting up and tearing down state since
         MultiProcessTestCase runs each `test*` method in a separate process and
         each process just runs the `test*` method without actually calling
         'setUp' and 'tearDown' methods of unittest.
-    """
-
-    def wrapper(self):
+    '''
+    @functools.wraps(test_method)
+    def wrapper(self, *arg, **kwargs):
         store = dist.FileStore(self.file.name, self.world_size)
-        dist.init_process_group(
-            backend="gloo", rank=self.rank, world_size=self.world_size, store=store
-        )
-        dist.init_model_parallel(
-            self_name="worker%d" % self.rank,
-            backend=BACKEND,
-            self_rank=self.rank,
-            init_method=RPC_INIT_URL,
-        )
-        func(self)
+        dist.init_process_group(backend='gloo', rank=self.rank,
+                                world_size=self.world_size, store=store)
+        dist.init_model_parallel(self_name='worker%d' % self.rank,
+                                 backend=BACKEND,
+                                 self_rank=self.rank,
+                                 init_method=RPC_INIT_URL)
+        test_method(self, *arg, **kwargs)
         dist.join_rpc()
 
     return wrapper
@@ -133,6 +137,23 @@ class RpcTest(MultiProcessTestCase):
             RuntimeError, "does not support making RPC calls to self"
         ):
             dist.rpc_sync(self_worker_name, torch.add, args=(torch.ones(2, 2), 1))
+
+    @mock.patch.object(torch.distributed.autograd, "_init")
+    @mock.patch.object(torch.distributed.rpc_api, "init_rref_context")
+    def test_register_rpc_backend_and_init_rpc_backend(
+        self,
+        mock_init_rref_context,
+        mock_dist_autograd_init,
+    ):
+        backend_name = "stub_backend"
+        rpc_backend_registry.register_rpc_backend(
+            backend_name, stub_init_rpc_backend_handler
+        )
+        dist.init_model_parallel(
+            self_name='worker1',
+            backend=backend_name,
+            self_rank=1
+        )
 
     @unittest.skipIf(
         BACKEND != RpcBackend.PROCESS_GROUP,
